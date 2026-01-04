@@ -42,7 +42,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.sequence import IntermediateTensors
 
@@ -1046,11 +1051,16 @@ class T5Gemma2Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
+        encoder_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        encoder_outputs = self.encoder(
-            input_ids=encoder_input_ids,
-            pixel_values=pixel_values,
-        )
+        # Use pre-computed encoder outputs if provided, otherwise compute them
+        if encoder_hidden_states is None:
+            encoder_outputs = self.encoder(
+                input_ids=encoder_input_ids,
+                pixel_values=pixel_values,
+            )
+        else:
+            encoder_outputs = encoder_hidden_states
 
         decoder_outputs = self.decoder(
             input_ids=input_ids,
@@ -1099,12 +1109,14 @@ class T5Gemma2Model(nn.Module):
         return loaded_params
 
 
-class T5Gemma2ForConditionalGeneration(nn.Module, SupportsLoRA, SupportsPP):
+class T5Gemma2ForConditionalGeneration(nn.Module, SupportsLoRA, SupportsPP, SupportsMultiModal):
     """T5Gemma2 for conditional generation (seq2seq)."""
 
     packed_modules_mapping = {
         # No packed modules - we use separate projections for all layers
     }
+    
+    supports_multimodal = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1140,11 +1152,19 @@ class T5Gemma2ForConditionalGeneration(nn.Module, SupportsLoRA, SupportsPP):
         pixel_values: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        if encoder_outputs is None:
-            encoder_outputs = self.model.get_encoder_outputs(
-                kwargs.get("encoder_input_ids"), pixel_values
-            )
+        # Convert encoder_outputs list to tensor if needed
+        encoder_hidden_states = None
+        if encoder_outputs is not None:
+            if isinstance(encoder_outputs, list) and len(encoder_outputs) > 0:
+                encoder_hidden_states = (
+                    torch.cat(encoder_outputs, dim=0)
+                    if len(encoder_outputs) > 1
+                    else encoder_outputs[0]
+                )
+            elif not isinstance(encoder_outputs, list):
+                encoder_hidden_states = encoder_outputs
 
+        # Pass encoder_hidden_states to the model
         decoder_outputs = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1152,6 +1172,7 @@ class T5Gemma2ForConditionalGeneration(nn.Module, SupportsLoRA, SupportsPP):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             pixel_values=pixel_values,
+            encoder_hidden_states=encoder_hidden_states,
         )
         return decoder_outputs
 
@@ -1163,6 +1184,42 @@ class T5Gemma2ForConditionalGeneration(nn.Module, SupportsLoRA, SupportsPP):
         # The logits_processor expects an embedding layer with a quant_method attribute
         logits = self.logits_processor(self.model.decoder.embed_tokens, hidden_states)
         return logits
+    
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """Process encoder inputs and return encoder outputs.
+        
+        For T5Gemma2, we treat text encoding as a "multimodal" operation
+        to leverage vLLM's multimodal infrastructure for encoder-decoder models.
+        
+        This method processes the input text through the encoder and returns
+        the encoder outputs, which will be cached and passed to the decoder.
+        """
+        # Extract encoder_input_ids from kwargs
+        # The engine will pass this when processing encoder inputs
+        encoder_input_ids = kwargs.get("encoder_input_ids")
+        pixel_values = kwargs.get("pixel_values")
+        
+        if encoder_input_ids is None:
+            # Return empty list if no encoder input
+            return []
+        
+        # Process through encoder
+        encoder_outputs = self.model.get_encoder_outputs(
+            encoder_input_ids, pixel_values
+        )
+        
+        # Return as a list (required by MultiModalEmbeddings type)
+        # The engine expects a list of tensors, one per "multimodal item"
+        return [encoder_outputs]
+    
+    def get_language_model(self) -> nn.Module:
+        """Return the decoder as the language model."""
+        return self.model.decoder
+    
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        """T5Gemma2 doesn't use placeholder strings for text encoding."""
+        return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:
         # T5Gemma2 has tied weights between encoder and decoder embed_tokens
